@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PC清理助手 v1.4.0
+PC清理助手 v1.5.0
 Windows系统盘垃圾扫描与安全清理工具
 专为电脑小白设计 - 安全第一，操作简单
 
@@ -24,7 +24,7 @@ from tkinter import ttk, messagebox
 # ============================================================
 
 APP_NAME = "PC清理助手"
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 APP_TITLE = f"{APP_NAME} v{VERSION}"
 
 # Colors for risk levels
@@ -277,6 +277,31 @@ FOF_SILENT = 0x0004
 FOF_NOERRORUI = 0x0002
 
 
+class _SHFILEOPSTRUCTW(ctypes.Structure):
+    """Windows SHFILEOPSTRUCTW — passed to SHFileOperationW."""
+    _fields_ = [
+        ("hwnd", ctypes.c_void_p),
+        ("wFunc", ctypes.c_uint),
+        ("pFrom", ctypes.c_wchar_p),
+        ("pTo", ctypes.c_wchar_p),
+        ("fFlags", ctypes.c_uint16),
+        ("fAnyOperationsAborted", ctypes.c_int),
+        ("hNameMappings", ctypes.c_void_p),
+        ("lpszProgressTitle", ctypes.c_wchar_p),
+    ]
+
+
+def _make_double_null_buf(paths):
+    """Build a double-null-terminated wide string buffer from a list of paths."""
+    joined = '\0'.join(paths)
+    buf = (ctypes.c_wchar * (len(joined) + 2))()
+    for i, ch in enumerate(joined):
+        buf[i] = ch
+    buf[len(joined)] = '\0'
+    buf[len(joined) + 1] = '\0'
+    return buf
+
+
 def send_to_recycle_bin(filepath, parent_hwnd=None):
     """
     Send a file or directory to the Recycle Bin using Windows Shell API.
@@ -284,26 +309,37 @@ def send_to_recycle_bin(filepath, parent_hwnd=None):
     """
     try:
         path_abs = os.path.abspath(filepath)
-        # Double-null-terminated wide string (required by SHFileOperationW)
-        buf = (ctypes.c_wchar * (len(path_abs) + 2))()
-        for i, ch in enumerate(path_abs):
-            buf[i] = ch
-        buf[len(path_abs)] = '\0'
-        buf[len(path_abs) + 1] = '\0'
+        buf = _make_double_null_buf([path_abs])
 
-        class SHFILEOPSTRUCTW(ctypes.Structure):
-            _fields_ = [
-                ("hwnd", ctypes.c_void_p),
-                ("wFunc", ctypes.c_uint),
-                ("pFrom", ctypes.c_wchar_p),
-                ("pTo", ctypes.c_wchar_p),
-                ("fFlags", ctypes.c_uint16),
-                ("fAnyOperationsAborted", ctypes.c_int),
-                ("hNameMappings", ctypes.c_void_p),
-                ("lpszProgressTitle", ctypes.c_wchar_p),
-            ]
+        fileop = _SHFILEOPSTRUCTW()
+        fileop.hwnd = parent_hwnd or 0
+        fileop.wFunc = FO_DELETE
+        fileop.pFrom = ctypes.cast(ctypes.pointer(buf), ctypes.c_wchar_p)
+        fileop.pTo = None
+        fileop.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI
+        fileop.fAnyOperationsAborted = 0
+        fileop.hNameMappings = None
+        fileop.lpszProgressTitle = None
 
-        fileop = SHFILEOPSTRUCTW()
+        result = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(fileop))
+        return result == 0
+    except Exception:
+        return False
+
+
+def send_multiple_to_recycle_bin(filepaths, parent_hwnd=None):
+    """
+    Send MULTIPLE files/directories to the Recycle Bin in a single Shell API call.
+    Batching paths slashes per-file Shell overhead, making cleanup much faster.
+    Returns True when ALL paths were successfully recycled.
+    """
+    if not filepaths:
+        return True
+    try:
+        paths_abs = [os.path.abspath(p) for p in filepaths]
+        buf = _make_double_null_buf(paths_abs)
+
+        fileop = _SHFILEOPSTRUCTW()
         fileop.hwnd = parent_hwnd or 0
         fileop.wFunc = FO_DELETE
         fileop.pFrom = ctypes.cast(ctypes.pointer(buf), ctypes.c_wchar_p)
@@ -375,7 +411,7 @@ def delete_empty_dir(dirpath):
 def clean_directory_contents(dirpath, progress_callback=None):
     """
     Clean CONTENTS of a directory — walk through all files/subdirs bottom-up,
-    delete each using direct-delete strategy.
+    delete each using batched Shell API calls for speed.
     NEVER deletes the top-level directory itself.
     
     Returns (deleted_count, reboot_count, failed_count, freed_bytes, errors_list).
@@ -389,8 +425,9 @@ def clean_directory_contents(dirpath, progress_callback=None):
     freed = 0
     errors = []
     
-    # Gather all items bottom-up, capturing size during walk (single stat)
-    all_items = []
+    # Walk bottom-up, collecting files (batched) and empty dirs
+    all_files = []    # [(path, size)]
+    all_dirs = []     # [path]
     try:
         for root, dirs, files in os.walk(dirpath, topdown=False):
             for f in files:
@@ -399,50 +436,71 @@ def clean_directory_contents(dirpath, progress_callback=None):
                     fsize = os.path.getsize(fpath)
                 except OSError:
                     fsize = 0
-                all_items.append(("file", fpath, fsize))
+                all_files.append((fpath, fsize))
             for d in dirs:
-                all_items.append(("dir", os.path.join(root, d), 0))
-            time.sleep(0)  # Yield CPU during gather
+                all_dirs.append(os.path.join(root, d))
     except PermissionError:
         pass
     
-    total = len(all_items)
-    if total > 5000:
-        errors.append(f"[限制] 目录包含{total}个项目，仅处理前5000个")
-        all_items = all_items[:5000]
-        total = 5000
+    total_files = len(all_files)
+    total_dirs = len(all_dirs)
+    total = total_files + total_dirs
     
-    # Throttle progress updates — only update UI every N items
+    # Enforce item limit
+    if total_files > 5000:
+        errors.append(f"[限制] 目录包含{total}个项目，仅处理前5000个")
+        all_files = all_files[:5000]
+        total_files = 5000
+        total = 5000 + total_dirs
+    
     progress_interval = max(1, total // 50) if total > 50 else 1
     
-    for i, (item_type, item_path, size_before) in enumerate(all_items):
-        # Throttled progress callback
-        if progress_callback and total > 0 and (i % progress_interval == 0 or i == total - 1):
-            progress_callback(i + 1, total, os.path.basename(item_path))
+    # === Batch-delete files ===
+    # SHFileOperationW accepts multiple null-separated paths in pFrom.
+    # Batching 30 files per API call saves enormous Shell overhead.
+    BATCH_SIZE = 30
+    processed = 0
+    
+    for batch_start in range(0, total_files, BATCH_SIZE):
+        batch = all_files[batch_start:batch_start + BATCH_SIZE]
+        batch_paths = [fp for fp, _ in batch]
+        batch_freed = sum(sz for _, sz in batch)
         
-        try:
-            if item_type == "file":
-                result, reason = delete_file(item_path)
+        # Progress: one update per batch
+        processed += len(batch)
+        if progress_callback:
+            pct = min(processed + total_dirs, total)
+            if pct % progress_interval == 0 or pct >= total:
+                progress_callback(pct, total, os.path.basename(batch_paths[0]))
+        
+        # Try batch recycle bin — single Shell API call for all files
+        if send_multiple_to_recycle_bin(batch_paths):
+            deleted += len(batch)
+            freed += batch_freed
+        else:
+            # Batch failed (likely locked file). Fall back to individual per file.
+            for fpath, fsize in batch:
+                result, reason = delete_file(fpath)
                 if result == "recycled" or result == "deleted":
                     deleted += 1
-                    freed += size_before
+                    freed += fsize
                 elif result == "reboot":
                     reboot += 1
-                    freed += size_before
+                    freed += fsize
                 else:
                     failed += 1
                     if len(errors) < 30:
-                        errors.append(f"[跳过] {item_path} — {reason}")
-            else:  # directory
-                delete_empty_dir(item_path)
-                # Don't count dirs in stats
-        except Exception as e:
-            failed += 1
-            if len(errors) < 30:
-                errors.append(f"[错误] {item_path}: {e}")
+                        errors.append(f"[跳过] {fpath} — {reason}")
         
-        if i % 500 == 0:
-            time.sleep(0)  # Yield CPU periodically
+        time.sleep(0)  # Yield CPU between batches only
+    
+    # === Remove empty subdirectories (reverse order = deepest first) ===
+    for dpath in reversed(all_dirs):
+        delete_empty_dir(dpath)
+        processed += 1
+        if progress_callback:
+            if processed % progress_interval == 0 or processed >= total:
+                progress_callback(processed, total, os.path.basename(dpath))
     
     return deleted, reboot, failed, freed, errors
 
