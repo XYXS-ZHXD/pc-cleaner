@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PC清理助手 v1.5.0
+PC清理助手 v1.6.0
 Windows系统盘垃圾扫描与安全清理工具
 专为电脑小白设计 - 安全第一，操作简单
 
@@ -24,7 +24,7 @@ from tkinter import ttk, messagebox
 # ============================================================
 
 APP_NAME = "PC清理助手"
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 APP_TITLE = f"{APP_NAME} v{VERSION}"
 
 # Colors for risk levels
@@ -503,6 +503,78 @@ def clean_directory_contents(dirpath, progress_callback=None):
                 progress_callback(processed, total, os.path.basename(dpath))
     
     return deleted, reboot, failed, freed, errors
+
+def permanent_clean_directory(dirpath, progress_callback=None):
+    """
+    Permanently delete directory contents using os.remove (no recycle bin).
+    For system temp/update directories (e.g. SoftwareDistribution/Download)
+    where Shell API recycle bin doesn't work on SYSTEM-owned files.
+    
+    Returns (deleted_count, freed_bytes, errors_list).
+    """
+    if not os.path.isdir(dirpath):
+        return 0, 0, []
+    
+    deleted = 0
+    freed = 0
+    errors = []
+    items = []
+    
+    try:
+        for root, dirs, files in os.walk(dirpath, topdown=False):
+            for f in files:
+                fpath = os.path.join(root, f)
+                try:
+                    fsize = os.path.getsize(fpath)
+                except OSError:
+                    fsize = 0
+                items.append(("file", fpath, fsize))
+            for d in dirs:
+                items.append(("dir", os.path.join(root, d), 0))
+    except PermissionError:
+        pass
+    
+    total = len(items)
+    if total > 5000:
+        errors.append(f"[限制] 目录超过5000项，仅处理前5000个")
+        items = items[:5000]
+        total = 5000
+    
+    progress_interval = max(1, total // 50) if total > 50 else 1
+    
+    for i, (item_type, item_path, size_before) in enumerate(items):
+        if progress_callback and total > 0 and (i % progress_interval == 0 or i == total - 1):
+            progress_callback(i + 1, total, os.path.basename(item_path))
+        
+        try:
+            if item_type == "file":
+                # Permanent delete — no recycle bin
+                try:
+                    os.remove(item_path)
+                    deleted += 1
+                    freed += size_before
+                except (PermissionError, OSError):
+                    try:
+                        os.chmod(item_path, 0o777)
+                        os.remove(item_path)
+                        deleted += 1
+                        freed += size_before
+                    except (PermissionError, OSError):
+                        # Try reboot-mark as last resort
+                        if mark_for_reboot_delete(item_path):
+                            deleted += 1
+                            freed += size_before
+                            errors.append(f"[重启删] {item_path}")
+                        else:
+                            if len(errors) < 30:
+                                errors.append(f"[跳过] {item_path}")
+            else:
+                delete_empty_dir(item_path)
+        except Exception as e:
+            pass
+    
+    return deleted, freed, errors
+
 
 def open_disk_cleanup():
     """Open Windows Disk Cleanup tool. User can manually select items to clean."""
@@ -1124,13 +1196,12 @@ class PcCleanerApp:
                         self.root.after(0, lambda _n=item_name: self.status_label.config(
                             text=f"正在清理: {_n}..."
                         ))
-                        d, r, f, b, errs = clean_directory_contents(path)
+                        # 系统更新缓存用永久删除（回收站对 SYSTEM 文件无效）
+                        d, b, errs = permanent_clean_directory(path)
                         success_count += d
-                        reboot_count += r
-                        fail_count += f
                         freed_bytes += b
-                        if d + r > 0 or f > 0:
-                            log_entries.append(f"[Windows更新清理] 已移至回收站{d}, 重启删{r}, 跳过{f}")
+                        if d > 0 or errs:
+                            log_entries.append(f"[Windows更新清理] 已删除{d}项, 释放{format_size(b)}")
                         if errs:
                             log_entries.extend(errs[:20])
                     finally:
