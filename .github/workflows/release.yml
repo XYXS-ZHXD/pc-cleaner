@@ -23,17 +23,38 @@ jobs:
       - name: 安装 PyInstaller
         run: pip install pyinstaller
 
-      - name: 编译 EXE
-        run: pyinstaller --onefile --windowed --name "PC清理助手" --icon app_icon.ico --uac-admin --distpath dist pc_cleaner.py
+      - name: 编译 EXE（英文名避免中文文件名丢失）
+        run: |
+          # 编译成 PC-Cleaner.exe（Release 资产使用英文名）
+          pyinstaller --onefile --windowed --name "PC-Cleaner" --icon app_icon.ico --uac-admin --distpath dist pc_cleaner.py
 
       - name: 创建 Release 并上传资产
         uses: softprops/action-gh-release@v2
         with:
-          name: PC清理助手 ${{ github.ref_name }}
+          name:  PC清理助手 ${{ github.ref_name }}
           body: |
-            自动构建发布。
+            ## PC清理助手 v${{ github.ref_name }} 🧹
 
-            查看 README.md 了解详情。
-          files: dist/PC清理助手.exe
+            > 资产文件 [PC-Cleaner.exe] 即「PC清理助手.exe」
+
+            ### 功能
+            - 🔍 **智能扫描**：预定义20+高概率垃圾靶点，秒级出结果
+            - 🟢 **安全清理**：系统临时文件、浏览器缓存、Windows更新残留
+            - 🟡 **谨慎处理**：Windows.old 等需确认项目，默认折叠隐藏
+            - 📊 **C盘大文件夹TOP10**：快速定位大文件占位
+            - 🛡️ **白名单保护**：System32/WinSxS 绝不触碰
+            - 🔄 **重启清理**：被占用文件标记开机删除
+            - ♻️ **回收站机制**：可还原
+
+            ### 使用
+            1. 下载 PC-Cleaner.exe
+            2. **右键 → 以管理员身份运行**
+            3. 点「开始扫描 C 盘」
+            4. 点「清理选中项」
+
+            ---
+
+            *Made with ❤️ by 一个修电脑的*
+          files: dist/PC-Cleaner.exe
           draft: false
           prerelease: false
