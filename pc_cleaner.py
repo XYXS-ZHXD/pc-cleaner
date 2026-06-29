@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PC清理助手 v1.2.0
+PC清理助手 v1.3.0
 Windows系统盘垃圾扫描与安全清理工具
 专为电脑小白设计 - 安全第一，操作简单
 
@@ -24,7 +24,7 @@ from tkinter import ttk, messagebox
 # ============================================================
 
 APP_NAME = "PC清理助手"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 APP_TITLE = f"{APP_NAME} v{VERSION}"
 
 # Colors for risk levels
@@ -237,12 +237,64 @@ def get_dir_size_fast(path, timeout=5.0, _depth=0):
     return total, True, approx
 
 # ============================================================
-# File Deletion Engine — multi-strategy: direct delete first,
-# fallback to reboot-mark for locked files
+# File Deletion Engine — multi-strategy:
+#   1. Send to Recycle Bin (recoverable)
+#   2. Remove read-only, retry Recycle Bin
+#   3. Mark for reboot-delete (locked files)
 # ============================================================
 
 # MoveFileEx constants
 MOVEFILE_DELAY_UNTIL_REBOOT = 0x0004
+
+# SHFileOperation constants
+FO_DELETE = 3
+FOF_ALLOWUNDO = 0x0040
+FOF_NOCONFIRMATION = 0x0010
+FOF_SILENT = 0x0004
+FOF_NOERRORUI = 0x0002
+
+
+def send_to_recycle_bin(filepath, parent_hwnd=None):
+    """
+    Send a file or directory to the Recycle Bin using Windows Shell API.
+    Returns True on success.
+    """
+    try:
+        path_abs = os.path.abspath(filepath)
+        # Double-null-terminated wide string (required by SHFileOperationW)
+        buf = (ctypes.c_wchar * (len(path_abs) + 2))()
+        for i, ch in enumerate(path_abs):
+            buf[i] = ch
+        buf[len(path_abs)] = '\0'
+        buf[len(path_abs) + 1] = '\0'
+
+        class SHFILEOPSTRUCTW(ctypes.Structure):
+            _fields_ = [
+                ("hwnd", ctypes.c_void_p),
+                ("wFunc", ctypes.c_uint),
+                ("pFrom", ctypes.c_wchar_p),
+                ("pTo", ctypes.c_wchar_p),
+                ("fFlags", ctypes.c_uint16),
+                ("fAnyOperationsAborted", ctypes.c_int),
+                ("hNameMappings", ctypes.c_void_p),
+                ("lpszProgressTitle", ctypes.c_wchar_p),
+            ]
+
+        fileop = SHFILEOPSTRUCTW()
+        fileop.hwnd = parent_hwnd or 0
+        fileop.wFunc = FO_DELETE
+        fileop.pFrom = ctypes.cast(ctypes.pointer(buf), ctypes.c_wchar_p)
+        fileop.pTo = None
+        fileop.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI
+        fileop.fAnyOperationsAborted = 0
+        fileop.hNameMappings = None
+        fileop.lpszProgressTitle = None
+
+        result = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(fileop))
+        return result == 0
+    except Exception:
+        return False
+
 
 def mark_for_reboot_delete(filepath):
     """Schedule a file for deletion on next system reboot (for locked files)."""
@@ -254,33 +306,29 @@ def mark_for_reboot_delete(filepath):
     except Exception:
         return False
 
+
 def delete_file(filepath):
     """
     Try to delete a single file. Strategies in order:
-    1. os.remove() — direct delete
-    2. os.chmod + os.remove() — remove read-only then delete  
+    1. Send to Recycle Bin (recoverable via Shell API)
+    2. Remove read-only attribute, retry Recycle Bin
     3. MoveFileEx(MOVEFILE_DELAY_UNTIL_REBOOT) — mark for reboot
-    Returns ("deleted" | "reboot" | "skipped", reason_string)
+    Returns ("recycled" | "reboot" | "skipped", reason_string)
     """
     if not os.path.exists(filepath):
-        return "deleted", ""
+        return "recycled", ""
 
     path_abs = os.path.abspath(filepath)
 
-    # Strategy 1: direct delete
-    try:
-        os.remove(path_abs)
-        return "deleted", ""
-    except PermissionError:
-        pass
-    except OSError:
-        pass
+    # Strategy 1: Send to Recycle Bin (recoverable!)
+    if send_to_recycle_bin(path_abs):
+        return "recycled", ""
 
     # Strategy 2: remove read-only attribute, retry
     try:
         os.chmod(path_abs, 0o777)
-        os.remove(path_abs)
-        return "deleted", ""
+        if send_to_recycle_bin(path_abs):
+            return "recycled", ""
     except (PermissionError, OSError):
         pass
 
@@ -351,7 +399,7 @@ def clean_directory_contents(dirpath, progress_callback=None):
                     pass
                 
                 result, reason = delete_file(item_path)
-                if result == "deleted":
+                if result == "recycled" or result == "deleted":
                     deleted += 1
                     freed += size_before
                 elif result == "reboot":
@@ -927,7 +975,7 @@ class PcCleanerApp:
             "确认清理",
             f"即将清理以下项目：\n\n{item_list}\n\n"
             f"预计释放 {format_size(total_size)} 空间\n\n"
-            f"无法删除的文件将标记为开机后清理。\n确定继续吗？",
+            f"清理的文件将移至回收站（可还原）。\n无法删除的文件将标记为开机后清理。\n确定继续吗？",
             icon="warning"
         )
         
@@ -968,6 +1016,46 @@ class PcCleanerApp:
                         log_entries.append("[FAIL] Windows.old - 无法打开磁盘清理工具")
                     continue
                 
+                # Special handling for Windows Update download
+                # Files here are locked by wuauserv / BITS services
+                if "SoftwareDistribution" in path and "Download" in path:
+                    services_stopped = False
+                    if self.is_admin:
+                        self.root.after(0, lambda: self.status_label.config(
+                            text="正在暂停 Windows Update 服务..."
+                        ))
+                        subprocess.run(["net", "stop", "wuauserv", "/y"],
+                            capture_output=True, timeout=30)
+                        subprocess.run(["net", "stop", "bits", "/y"],
+                            capture_output=True, timeout=30)
+                        services_stopped = True
+                        log_entries.append("[服务] Windows Update / BITS 已暂停")
+                    
+                    try:
+                        self.root.after(0, lambda _n=item_name: self.status_label.config(
+                            text=f"正在清理: {_n}..."
+                        ))
+                        d, r, f, b, errs = clean_directory_contents(path)
+                        success_count += d
+                        reboot_count += r
+                        fail_count += f
+                        freed_bytes += b
+                        if d + r > 0 or f > 0:
+                            log_entries.append(f"[Windows更新清理] 已移至回收站{d}, 重启删{r}, 跳过{f}")
+                        if errs:
+                            log_entries.extend(errs[:20])
+                    finally:
+                        if services_stopped:
+                            self.root.after(0, lambda: self.status_label.config(
+                                text="正在恢复 Windows Update 服务..."
+                            ))
+                            subprocess.run(["net", "start", "wuauserv"],
+                                capture_output=True, timeout=30)
+                            subprocess.run(["net", "start", "bits"],
+                                capture_output=True, timeout=30)
+                            log_entries.append("[服务] Windows Update / BITS 已恢复")
+                    continue
+                
                 # For Firefox, handle multi-profile
                 if path and os.path.isdir(path) and "Firefox" in path:
                     try:
@@ -979,7 +1067,7 @@ class PcCleanerApp:
                                 reboot_count += r
                                 fail_count += f
                                 freed_bytes += b
-                                log_entries.append(f"[目录清理] {cache_dir}: 已删{d}, 重启删{r}, 跳过{f}")
+                                log_entries.append(f"[目录清理] {cache_dir}: 移至回收站{d}, 重启删{r}, 跳过{f}")
                                 log_entries.extend(errs[:20])
                     except (PermissionError, OSError):
                         fail_count += 1
@@ -1001,16 +1089,16 @@ class PcCleanerApp:
                     fail_count += f
                     freed_bytes += b
                     if d + r > 0 or f > 0:
-                        log_entries.append(f"[目录清理] {path}: 已删{d}, 重启删{r}, 跳过{f}")
+                        log_entries.append(f"[目录清理] {path}: 移至回收站{d}, 重启删{r}, 跳过{f}")
                     if errs:
                         log_entries.extend(errs[:20])
                 else:
                     # Single file
                     result, reason = delete_file(path)
-                    if result == "deleted":
+                    if result == "recycled" or result == "deleted":
                         success_count += 1
                         freed_bytes += item["size"]
-                        log_entries.append(f"[OK] {path}")
+                        log_entries.append(f"[回收站] {path}")
                     elif result == "reboot":
                         reboot_count += 1
                         freed_bytes += item["size"]
@@ -1024,7 +1112,7 @@ class PcCleanerApp:
                 f.write(f"PC清理助手 v{VERSION} 清理日志\n")
                 f.write(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
                 f.write(f"管理员权限: {'是' if self.is_admin else '否'}\n")
-                f.write(f"清理项数: 成功 {success_count}, 重启后删除 {reboot_count}, 失败 {fail_count}\n")
+                f.write(f"清理项数: 回收站 {success_count}, 重启后删除 {reboot_count}, 失败 {fail_count}\n")
                 f.write(f"释放空间: {format_size(freed_bytes)}\n")
                 f.write("-" * 50 + "\n")
                 f.write("\n".join(log_entries))
