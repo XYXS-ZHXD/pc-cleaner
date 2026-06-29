@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PC清理助手 v1.6.0
+PC清理助手 v1.6.1
 Windows系统盘垃圾扫描与安全清理工具
 专为电脑小白设计 - 安全第一，操作简单
 
@@ -24,7 +24,7 @@ from tkinter import ttk, messagebox
 # ============================================================
 
 APP_NAME = "PC清理助手"
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 APP_TITLE = f"{APP_NAME} v{VERSION}"
 
 # Colors for risk levels
@@ -105,10 +105,8 @@ SCAN_TARGETS = [
      "subdir": "cache2"},
 
     # Delivery Optimization cache
-    {"name": "传递优化文件", "path": os.path.join(SYS_ROOT, "ServiceState", "EventLog"),
-     "level": "safe", "desc": "Windows更新传递优化缓存"},
     {"name": "传递优化缓存", "path": os.path.join(SYS_ROOT, "SoftwareDistribution", "DeliveryOptimization"),
-     "level": "safe", "desc": "Windows更新分发优化文件"},
+     "level": "safe", "desc": "Windows更新分发优化文件，可安全清理"},
 
     # Crash dumps (cautious)
     {"name": "系统崩溃转储", "path": os.path.join(SYS_ROOT, "Minidump"), "level": "cautious",
@@ -371,7 +369,8 @@ def delete_file(filepath):
     Try to delete a single file. Strategies in order:
     1. Send to Recycle Bin (recoverable via Shell API)
     2. Remove read-only attribute, retry Recycle Bin
-    3. MoveFileEx(MOVEFILE_DELAY_UNTIL_REBOOT) — mark for reboot
+    3. os.remove() — permanent delete (for SYSTEM-owned files that can\'t be recycled)
+    4. MoveFileEx(MOVEFILE_DELAY_UNTIL_REBOOT) — mark for reboot (last resort)
     Returns ("recycled" | "reboot" | "skipped", reason_string)
     """
     if not os.path.exists(filepath):
@@ -383,7 +382,7 @@ def delete_file(filepath):
     if send_to_recycle_bin(path_abs):
         return "recycled", ""
 
-    # Strategy 2: remove read-only attribute, retry
+    # Strategy 2: remove read-only attribute, retry recycle bin
     try:
         os.chmod(path_abs, 0o777)
         if send_to_recycle_bin(path_abs):
@@ -391,7 +390,16 @@ def delete_file(filepath):
     except (PermissionError, OSError):
         pass
 
-    # Strategy 3: mark for deletion on reboot
+    # Strategy 3: permanent delete (for SYSTEM-owned files)
+    # These can\'t go to user recycle bin. Delete immediately rather than
+    # marking for reboot — avoids boot-time race conditions.
+    try:
+        os.remove(path_abs)
+        return "recycled", ""
+    except (PermissionError, OSError):
+        pass
+
+    # Strategy 4: mark for deletion on reboot (last resort)
     if mark_for_reboot_delete(path_abs):
         return "reboot", ""
 
