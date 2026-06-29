@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PC清理助手 v1.3.0
+PC清理助手 v1.4.0
 Windows系统盘垃圾扫描与安全清理工具
 专为电脑小白设计 - 安全第一，操作简单
 
@@ -24,7 +24,7 @@ from tkinter import ttk, messagebox
 # ============================================================
 
 APP_NAME = "PC清理助手"
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 APP_TITLE = f"{APP_NAME} v{VERSION}"
 
 # Colors for risk levels
@@ -154,42 +154,63 @@ def format_size(bytes_val):
         return f"{int(size)} B"
     return f"{size:.1f} {units[i]}"
 
+def _scan_dir_size(path, depth=0, max_depth=2, timeout=3.0, start_time=None):
+    """
+    Recursively scan directory size using os.scandir (single stat per entry).
+    Returns (size_in_bytes, is_accessible)
+    """
+    if start_time is None:
+        start_time = time.time()
+    if time.time() - start_time > timeout:
+        return 0, True  # timed out, return best guess
+    if depth > max_depth:
+        return 0, True
+    
+    total = 0
+    try:
+        with os.scandir(path) as entries:
+            for entry in entries:
+                if time.time() - start_time > timeout:
+                    break
+                try:
+                    if entry.is_file(follow_symlinks=False):
+                        total += entry.stat().st_size
+                    elif entry.is_dir(follow_symlinks=False):
+                        sub_size, _ = _scan_dir_size(
+                            entry.path, depth=depth+1, max_depth=max_depth,
+                            timeout=timeout, start_time=start_time
+                        )
+                        total += sub_size
+                except (PermissionError, OSError):
+                    pass
+            time.sleep(0)  # Yield CPU per entry
+    except PermissionError:
+        return total if total > 0 else -1, False
+    except OSError:
+        return 0, False
+    
+    return total, True
+
+
 def get_dir_size(path, depth=2, timeout=3.0):
     """
     Get directory size with depth and time limits.
+    Uses os.scandir (single stat per entry) instead of os.path.getsize per file.
     Returns (size_in_bytes, accessible: bool)
     """
     if not os.path.exists(path):
         return 0, False
     
-    total = 0
-    start_time = time.time()
-    
     try:
         if os.path.isfile(path):
-            return os.path.getsize(path), True
+            try:
+                return os.path.getsize(path), True
+            except OSError:
+                return -1, False
         
-        # For directories, walk with depth limit
-        for root, dirs, files in os.walk(path):
-            if time.time() - start_time > timeout:
-                break
-            
-            rel_depth = root[len(path):].count(os.sep)
-            if rel_depth >= depth:
-                dirs[:] = []
-                continue
-            
-            for f in files:
-                try:
-                    total += os.path.getsize(os.path.join(root, f))
-                except OSError:
-                    pass
-    except PermissionError:
-        return total if total > 0 else -1, False
-    except OSError:
-        return total if total > 0 else -1, False
-    
-    return total, True
+        return _scan_dir_size(path, max_depth=depth, timeout=timeout)
+    except Exception:
+        return -1, False
 
 def get_dir_size_fast(path, timeout=5.0, _depth=0):
     """
@@ -229,11 +250,13 @@ def get_dir_size_fast(path, timeout=5.0, _depth=0):
                         total += sub_size
                 except (PermissionError, OSError):
                     pass
+            time.sleep(0)  # Yield CPU per entry
     except PermissionError:
         return -1 if total == 0 else total, False, approx
     except OSError:
         return 0, False, approx
     
+    time.sleep(0)
     return total, True, approx
 
 # ============================================================
@@ -366,14 +389,20 @@ def clean_directory_contents(dirpath, progress_callback=None):
     freed = 0
     errors = []
     
-    # Gather all items bottom-up (files first, then dirs)
+    # Gather all items bottom-up, capturing size during walk (single stat)
     all_items = []
     try:
         for root, dirs, files in os.walk(dirpath, topdown=False):
             for f in files:
-                all_items.append(("file", os.path.join(root, f)))
+                fpath = os.path.join(root, f)
+                try:
+                    fsize = os.path.getsize(fpath)
+                except OSError:
+                    fsize = 0
+                all_items.append(("file", fpath, fsize))
             for d in dirs:
-                all_items.append(("dir", os.path.join(root, d)))
+                all_items.append(("dir", os.path.join(root, d), 0))
+            time.sleep(0)  # Yield CPU during gather
     except PermissionError:
         pass
     
@@ -383,21 +412,16 @@ def clean_directory_contents(dirpath, progress_callback=None):
         all_items = all_items[:5000]
         total = 5000
     
-    for i, (item_type, item_path) in enumerate(all_items):
-        if progress_callback and total > 0:
+    # Throttle progress updates — only update UI every N items
+    progress_interval = max(1, total // 50) if total > 50 else 1
+    
+    for i, (item_type, item_path, size_before) in enumerate(all_items):
+        # Throttled progress callback
+        if progress_callback and total > 0 and (i % progress_interval == 0 or i == total - 1):
             progress_callback(i + 1, total, os.path.basename(item_path))
         
-        if not os.path.exists(item_path):
-            continue
-        
         try:
-            size_before = 0
             if item_type == "file":
-                try:
-                    size_before = os.path.getsize(item_path)
-                except OSError:
-                    pass
-                
                 result, reason = delete_file(item_path)
                 if result == "recycled" or result == "deleted":
                     deleted += 1
@@ -416,6 +440,9 @@ def clean_directory_contents(dirpath, progress_callback=None):
             failed += 1
             if len(errors) < 30:
                 errors.append(f"[错误] {item_path}: {e}")
+        
+        if i % 500 == 0:
+            time.sleep(0)  # Yield CPU periodically
     
     return deleted, reboot, failed, freed, errors
 
@@ -492,6 +519,8 @@ class ScanEngine:
             
             if progress_callback:
                 progress_callback(i + 1, len(SCAN_TARGETS), target["name"])
+            
+            time.sleep(0)  # Yield CPU between targets
     
     def scan_top_folders(self, progress_callback=None):
         """Find the top 10 largest folders on C: drive (targeted scan)."""
@@ -551,6 +580,8 @@ class ScanEngine:
                             pass
             except (PermissionError, OSError):
                 pass
+        
+        time.sleep(0)  # Yield CPU after scanning
         
         # Sort by size descending, take top 10
         all_folders.sort(key=lambda x: x["size"], reverse=True)
