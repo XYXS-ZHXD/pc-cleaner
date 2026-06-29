@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PC清理助手 v1.0
+PC清理助手 v1.2.0
 Windows系统盘垃圾扫描与安全清理工具
 专为电脑小白设计 - 安全第一，操作简单
 
@@ -15,7 +15,6 @@ import ctypes
 import threading
 import subprocess
 from datetime import datetime
-import ctypes
 
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -25,7 +24,7 @@ from tkinter import ttk, messagebox
 # ============================================================
 
 APP_NAME = "PC清理助手"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 APP_TITLE = f"{APP_NAME} v{VERSION}"
 
 # Colors for risk levels
@@ -171,13 +170,9 @@ def get_dir_size(path, depth=2, timeout=3.0):
             return os.path.getsize(path), True
         
         # For directories, walk with depth limit
-        current_depth = 0
         for root, dirs, files in os.walk(path):
             if time.time() - start_time > timeout:
                 break
-            if current_depth >= depth:
-                dirs[:] = []  # Don't go deeper
-                continue
             
             rel_depth = root[len(path):].count(os.sep)
             if rel_depth >= depth:
@@ -189,7 +184,6 @@ def get_dir_size(path, depth=2, timeout=3.0):
                     total += os.path.getsize(os.path.join(root, f))
                 except OSError:
                     pass
-            current_depth = rel_depth
     except PermissionError:
         return total if total > 0 else -1, False
     except OSError:
@@ -231,7 +225,7 @@ def get_dir_size_fast(path, timeout=5.0, _depth=0):
                         total += entry.stat().st_size
                     elif entry.is_dir(follow_symlinks=False):
                         # Only scan first level of each subdirectory
-                        sub_size, _, _ = get_dir_size_fast(entry.path, timeout=1.0, _depth=_depth+1)
+                        sub_size, _, _ = get_dir_size_fast(entry.path, timeout=timeout, _depth=_depth+1)
                         total += sub_size
                 except (PermissionError, OSError):
                     pass

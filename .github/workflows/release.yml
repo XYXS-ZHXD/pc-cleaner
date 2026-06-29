@@ -1,0 +1,39 @@
+name: 构建发布
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: 安装 PyInstaller
+        run: pip install pyinstaller
+
+      - name: 编译 EXE
+        run: pyinstaller --onefile --windowed --name "PC清理助手" --icon app_icon.ico --uac-admin --distpath dist pc_cleaner.py
+
+      - name: 创建 Release 并上传资产
+        uses: softprops/action-gh-release@v2
+        with:
+          name: PC清理助手 ${{ github.ref_name }}
+          body: |
+            自动构建发布。
+
+            查看 README.md 了解详情。
+          files: dist/PC清理助手.exe
+          draft: false
+          prerelease: false

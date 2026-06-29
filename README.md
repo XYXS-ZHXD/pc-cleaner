@@ -34,9 +34,9 @@
 
 ## 下载
 
-👉 [下载 PC清理助手.exe](https://github.com/REPLACE_WITH_YOUR_USERNAME/pc-cleaner/releases/latest)
+👉 [下载 PC清理助手.exe](https://github.com/XYXS-ZHXD/pc-cleaner/releases/latest)
 
-或者到 [Releases](https://github.com/REPLACE_WITH_YOUR_USERNAME/pc-cleaner/releases) 页面下载最新版本。
+或者到 [Releases](https://github.com/XYXS-ZHXD/pc-cleaner/releases) 页面下载最新版本。
 
 ---
 
@@ -65,6 +65,9 @@ python pc_cleaner.py
 pip install pyinstaller
 pyinstaller --onefile --windowed --name "PC清理助手" --icon app_icon.ico --uac-admin pc_cleaner.py
 ```
+
+> **CI 自动构建**：推送 Git tag 即可触发 GitHub Actions 自动编译并发布 Release。
+> 详见 `.github/workflows/release.yml`。
 
 ---
 
